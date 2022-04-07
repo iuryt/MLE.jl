@@ -113,20 +113,28 @@ compute_mixed_layer_depth!(simulation) = compute_mixed_layer_depth!(h, simulatio
 simulation.callbacks[:compute_mld] = Callback(compute_mixed_layer_depth!)
 
 # ---- 
-# ---- compute horizontal gradient of buoyancy
+# ---- compute gradient of buoyancy
 using Oceananigans.BoundaryConditions: fill_halo_regions!
 
+∂b∂x = Field{Face, Center, Center}(grid)
 ∂b∂y = Field{Center, Face, Center}(grid)
+∂b∂z = Field{Center, Center, Face}(grid)
 
 b = model.tracers.b
+∂b∂x_op = ∂x(b);
 ∂b∂y_op = ∂y(b);
+∂b∂z_op = ∂z(b);
 
-function compute_∂b∂y!(sim)
+function compute_∇b!(sim)
+    ∂b∂x .= ∂b∂x_op
     ∂b∂y .= ∂b∂y_op
+    ∂b∂z .= ∂b∂z_op
+    fill_halo_regions!(∂b∂x, sim.model.architecture)
     fill_halo_regions!(∂b∂y, sim.model.architecture)
+    fill_halo_regions!(∂b∂z, sim.model.architecture)
     return nothing
 end
-simulation.callbacks[:compute_∂b∂y] = Callback(compute_∂b∂y!)
+simulation.callbacks[:compute_∇b] = Callback(compute_∇b!)
 
 # ----
 # ---- compute Ψₑ
@@ -139,12 +147,13 @@ using Oceananigans.Grids
 using Oceananigans.Operators: Δzᶜᶜᶜ, Δzᶜᶜᶠ
 
 
-@kernel function _compute_Ψₑ!(Ψₑ, grid, h, ∂b, μ, f, ce, Lfₘ, ΔS, τ)
+@kernel function _compute_Ψₑ!(Ψₑ, grid, h, ∂ₕb, N, μ, f, ce, Lfₘ, ΔS, τ)
     i, j = @index(Global, NTuple)
 
-    # average ∇ₕb over the mixed layer
+    # average ∇ₕb and N over the mixed layer
     
-    ∂b_sum = 0
+    ∂ₕb_sum = 0
+    N_sum = 0
     Δz_sum = 0
 
     h_ij = @inbounds h[i, j]
@@ -156,20 +165,24 @@ using Oceananigans.Operators: Δzᶜᶜᶜ, Δzᶜᶜᶠ
 
             Δz_ijk = Δzᶜᶜᶜ(i, j, k, grid)
 
-            ∂b_sum = ∂b_sum + @inbounds ∂b[i, j, k] * Δz_ijk 
+            ∂ₕb_sum = ∂ₕb_sum + @inbounds ∂ₕb[i, j, k] * Δz_ijk
+            N_sum = N_sum + @inbounds N[i, j, k] * Δz_ijk 
             Δz_sum = Δz_sum + Δz_ijk
 
         end
     end
 
-    ∂bₘₗ = ∂b_sum/Δz_sum
+    ∂ₕbₘₗ = ∂ₕb_sum/Δz_sum
+    Nₘₗ = N_sum/Δz_sum
+    
+    Lf = max(Nₘₗ*h_ij/abs(f), Lfₘ)
     
     # compute eddy stream function
     @unroll for k in grid.Nz : -1 : 1 # scroll to point just above the bottom       
         z_face = znode(Center(), Face(), Face(), i, j, k, grid)
 
         if z_face > -h_ij
-            @inbounds Ψₑ[i, j, k] = ce * (ΔS/Lfₘ) * ((h_ij^2)/sqrt(f^2 + τ^-2)) * μ(z_face,h_ij) * ∂bₘₗ
+            @inbounds Ψₑ[i, j, k] = ce * (ΔS/Lf) * ((h_ij^2)/sqrt(f^2 + τ^-2)) * μ(z_face,h_ij) * ∂ₕbₘₗ
         else
             @inbounds Ψₑ[i, j, k] = 0.0
         end
@@ -177,13 +190,13 @@ using Oceananigans.Operators: Δzᶜᶜᶜ, Δzᶜᶜᶠ
 
 end
 
-function compute_Ψₑ!(Ψₑ, h, ∂b, μ, f; ce = 0.06, Lfₘ = 500meters, ΔS=10e3, τ=86400)
+function compute_Ψₑ!(Ψₑ, h, ∂ₕb, N, μ, f; ce = 0.06, Lfₘ = 500meters, ΔS=10e3, τ=86400)
     grid = h.grid
     arch = architecture(grid)
 
 
     event = launch!(arch, grid, :xy,
-                    _compute_Ψₑ!, Ψₑ, grid, h, ∂b, μ, f, ce, Lfₘ, ΔS, τ,
+                    _compute_Ψₑ!, Ψₑ, grid, h, ∂ₕb, N, μ, f, ce, Lfₘ, ΔS, τ,
                     dependencies = device_event(arch))
 
     wait(device_event(arch), event)
@@ -197,7 +210,7 @@ end
 # structure function
 @inline μ(z,h) = (1-(2*z/h + 1)^2)*(1+(5/21)*(2*z/h + 1)^2)
 
-compute_Ψₑ!(simulation) = compute_Ψₑ!(Ψx, h, ∂b∂y, μ, f)
+compute_Ψₑ!(simulation) = compute_Ψₑ!(Ψx, h, ∂b∂y, sqrt(∂b∂z), μ, f)
 # add the function to the callbacks of the simulation
 simulation.callbacks[:compute_Ψₑ] = Callback(compute_Ψₑ!)
 
