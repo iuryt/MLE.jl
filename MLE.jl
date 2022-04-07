@@ -3,17 +3,16 @@ using Oceananigans.Units
 
 # ---- define size and create a grid
 
-# define the size and max depth of the simulation
-const sponge = 20
-const Ny = 100
+const sponge = 20 #number of points for sponge
+const Ny = 46 # number of points in y
 const Nz = 48 # number of points in z
 const H = 1000 # maximum depth
 
-# create the grid of the model
+
 grid = RectilinearGrid(GPU(),
-    size=(Ny+2sponge, Nz),
+    size=(Ny+2sponge,Nz),
     halo=(3,3),
-    y=(-(Ny/2 + sponge)kilometers, (Ny/2 + sponge)kilometers), 
+    y=(-10*(Ny/2 + sponge)kilometers, 10*(Ny/2 + sponge)kilometers), 
     z=(H * cos.(LinRange(π/2,0,Nz+1)) .- H)meters,
     topology=(Flat, Bounded, Bounded)
 )
@@ -34,13 +33,17 @@ vertical_closure = ScalarDiffusivity(ν=νz, κ=νz)
 
 # ---- 
 # ---- instantiate model
+ub = Field((Face, Center, Center), grid)
+vb = Field((Center, Face, Center), grid)
+wb = Field((Center, Center, Face), grid)
 
 model = NonhydrostaticModel(grid = grid,
                             advection = WENO5(),
                             timestepper = :RungeKutta3,
                             coriolis = coriolis,
-                            closure=(horizontal_closure, vertical_closure),
+                            closure = (horizontal_closure, vertical_closure),
                             tracers = (:b),
+                            background_fields = (u=ub, v=vb, w=wb),
                             buoyancy = BuoyancyTracer())
 
 # ---- 
@@ -58,21 +61,15 @@ const ρₒ = 1026
 # front function
 @inline front(x, y, z, cy) = tanh((y-cy)/12kilometers)
 
-@inline D(x, y, z) = bg(z) + 0.8*decay(z)*((front(x, y, z, -120kilometers)+front(x, y, z, 0)+front(x, y, z, 120kilometers))-3)/6
-@inline B(x, y, z) = -(g/ρₒ)*D(x, y, z)
+@inline function B(x, y, z)
+    fronts = front(x, y, z, -120kilometers) + front(x, y, z, 0) + front(x, y, z, 120kilometers)
+    return -( g / ρₒ ) * ( bg(z) + 0.8 * decay(z) * (fronts - 3) / 6 )
+end
 
 set!(model; b = B)
 
 # ---- 
-# ---- create fields for mixed-layer depth, eddy stream function and gradient of buoyancy
-
-h = Field{Center, Center, Nothing}(grid)
-Ψₑ = Field{Center, Center, Center}(grid)
-∇ₕb = Field{Center, Center, Center}(grid)
-
-
-# ---- 
-# ---- grostrophic initial velocity
+# ---- geostrophic initial velocity
 
 b = model.tracers.b
 f = model.coriolis.f
@@ -97,18 +94,21 @@ set!(model; u = U)
 
 simulation = Simulation(model, Δt = 1minutes, stop_time = 10day)
 
-wizard = TimeStepWizard(cfl=1.0, max_change=1.1, max_Δt=3hours)
+wizard = TimeStepWizard(cfl=1.0, max_change=1.1, max_Δt=5minutes)
 simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
 # ---- 
 # ---- compute mixed-layer depth
+h = Field{Center, Center, Nothing}(grid)
 
 # buoyancy decrease criterium for determining the mixed-layer depth
 const g = 9.82 # gravity
 const ρₒ = 1026 # reference density
 const Δb=(g/ρₒ) * 0.03
+
 include("src/compute_mixed_layer_depth.jl")
 compute_mixed_layer_depth!(simulation) = compute_mixed_layer_depth!(h, simulation.model.tracers.b, Δb)
+
 # add the function to the callbacks of the simulation
 simulation.callbacks[:compute_mld] = Callback(compute_mixed_layer_depth!)
 
@@ -116,15 +116,17 @@ simulation.callbacks[:compute_mld] = Callback(compute_mixed_layer_depth!)
 # ---- compute horizontal gradient of buoyancy
 using Oceananigans.BoundaryConditions: fill_halo_regions!
 
-b = model.tracers.b
-∇ₕb_op = ∂x(b) + ∂y(b);
+∂b∂y = Field{Center, Face, Center}(grid)
 
-function compute_∇ₕb!(sim)
-    ∇ₕb .= ∇ₕb_op
-    fill_halo_regions!(∇ₕb, sim.model.architecture)
+b = model.tracers.b
+∂b∂y_op = ∂y(b);
+
+function compute_∂b∂y!(sim)
+    ∂b∂y .= ∂b∂y_op
+    fill_halo_regions!(∂b∂y, sim.model.architecture)
     return nothing
 end
-simulation.callbacks[:compute_∇ₕb] = Callback(compute_∇ₕb!)
+simulation.callbacks[:compute_∂b∂y] = Callback(compute_∂b∂y!)
 
 # ----
 # ---- compute Ψₑ
@@ -134,54 +136,54 @@ using KernelAbstractions.Extras.LoopInfo: @unroll
 using Oceananigans.Architectures: device_event, architecture
 using Oceananigans.Utils: launch!
 using Oceananigans.Grids
-using Oceananigans.Operators: Δzᶜᶜᶜ
+using Oceananigans.Operators: Δzᶜᶜᶜ, Δzᶜᶜᶠ
 
 
-@kernel function _compute_Ψₑ!(Ψₑ, grid, h, ∇ₕb, μ, f, ce, Lfₘ, dS)
+@kernel function _compute_Ψₑ!(Ψₑ, grid, h, ∂b, μ, f, ce, Lfₘ, ΔS, τ)
     i, j = @index(Global, NTuple)
 
     # average ∇ₕb over the mixed layer
     
-    ∇ₕb_sum = 0
-    dz_sum = 0
+    ∂b_sum = 0
+    Δz_sum = 0
 
+    h_ij = @inbounds h[i, j]
+    
     @unroll for k in grid.Nz : -1 : 1 # scroll from surface to bottom       
-        z_center = znode(Center(), Center(), Center(), i, j, k, grid)
+        z_center = znode(Center(), Face(), Face(), i, j, k, grid)
 
-        h_ijk = @inbounds h[i, j, k]
-
-        if z_center > -h_ijk
+        if z_center > -h_ij
 
             Δz_ijk = Δzᶜᶜᶜ(i, j, k, grid)
 
-            ∇ₕb_sum = ∇ₕb_sum + @inbounds ∇ₕb[i, j, k] * Δz_ijk 
-            dz_sum = dz_sum + Δz_ijk
+            ∂b_sum = ∂b_sum + @inbounds ∂b[i, j, k] * Δz_ijk 
+            Δz_sum = Δz_sum + Δz_ijk
 
         end
     end
 
-    ∇ₕbₘₗ = ∇ₕb_sum/dz_sum
+    ∂bₘₗ = ∂b_sum/Δz_sum
     
     # compute eddy stream function
     @unroll for k in grid.Nz : -1 : 1 # scroll to point just above the bottom       
-        z_center = znode(Center(), Center(), Center(), i, j, k, grid)
+        z_face = znode(Center(), Face(), Face(), i, j, k, grid)
 
-        h_ijk = @inbounds h[i, j, k]
-
-        if z_center > -h_ijk
-            @inbounds Ψₑ[i, j, k] = ce * (dS/Lfₘ) * ((h_ijk^2)/abs(f)) * μ(z_center,h_ijk) * ∇ₕbₘₗ  
+        if z_face > -h_ij
+            @inbounds Ψₑ[i, j, k] = ce * (ΔS/Lfₘ) * ((h_ij^2)/sqrt(f^2 + τ^-2)) * μ(z_face,h_ij) * ∂bₘₗ
+        else
+            @inbounds Ψₑ[i, j, k] = 0.0
         end
     end
 
 end
 
-function compute_Ψₑ!(Ψₑ, h, ∇ₕb, μ, f; ce = 0.06, Lfₘ = 500meters, dS=10e3)
+function compute_Ψₑ!(Ψₑ, h, ∂b, μ, f; ce = 0.06, Lfₘ = 500meters, ΔS=10e3, τ=86400)
     grid = h.grid
     arch = architecture(grid)
 
 
     event = launch!(arch, grid, :xy,
-                    _compute_Ψₑ!, Ψₑ, grid, h, ∇ₕb, μ, f, ce, Lfₘ, dS,
+                    _compute_Ψₑ!, Ψₑ, grid, h, ∂b, μ, f, ce, Lfₘ, ΔS, τ,
                     dependencies = device_event(arch))
 
     wait(device_event(arch), event)
@@ -189,17 +191,34 @@ function compute_Ψₑ!(Ψₑ, h, ∇ₕb, μ, f; ce = 0.06, Lfₘ = 500meters, 
     return nothing
 end
 
+# x-component of Ψ
+Ψx = Field{Center, Face, Face}(grid)
+
 # structure function
 @inline μ(z,h) = (1-(2*z/h + 1)^2)*(1+(5/21)*(2*z/h + 1)^2)
 
-compute_Ψₑ!(simulation) = compute_Ψₑ!(Ψₑ, h, ∇ₕb, μ, f)
+compute_Ψₑ!(simulation) = compute_Ψₑ!(Ψx, h, ∂b∂y, μ, f)
 # add the function to the callbacks of the simulation
 simulation.callbacks[:compute_Ψₑ] = Callback(compute_Ψₑ!)
+
+
+v_op = @at((Center, Face, Center),   ∂z(Ψx));
+w_op = @at((Center, Center, Face), - ∂y(Ψx));
+
+function compute_background_vel!(sim)
+    u, v, w = sim.model.background_fields.velocities
+    v .= v_op
+    w .= w_op
+    fill_halo_regions!(v, sim.model.architecture)
+    fill_halo_regions!(w, sim.model.architecture)
+    return nothing
+end
+simulation.callbacks[:compute_background_vel] = Callback(compute_background_vel!)
 
 # ----
 # ---- setting up the model output
 
-outputs = merge(model.velocities, model.tracers, (; h, ∇ₕb, Ψₑ)) # make a NamedTuple with all outputs
+outputs = merge(model.velocities, model.tracers, (; h, ∂b∂y, Ψx)) # make a NamedTuple with all outputs
 
 simulation.output_writers[:fields] =
     NetCDFOutputWriter(model, outputs, filepath = "data/output.nc",
