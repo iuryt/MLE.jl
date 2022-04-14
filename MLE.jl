@@ -1,20 +1,23 @@
 using Oceananigans
 using Oceananigans.Units
+using Oceananigans.BoundaryConditions: ImpenetrableBoundaryCondition
 
 # ---- define size and create a grid
 
 const sponge = 20 #number of points for sponge
+const Nx = 46 # number of points in x
 const Ny = 46 # number of points in y
 const Nz = 48 # number of points in z
 const H = 1000 # maximum depth
 
 
 grid = RectilinearGrid(GPU(),
-    size=(Ny+2sponge,Nz),
-    halo=(3,3),
-    y=(-10*(Ny/2 + sponge)kilometers, 10*(Ny/2 + sponge)kilometers), 
+    size=(Nx, Ny, Nz),
+    halo=(3, 3, 3),
+    x=(-10*(Nx/2)kilometers, 10*(Nx/2)kilometers), 
+    y=(-10*(Ny/2)kilometers, 10*(Ny/2)kilometers), 
     z=(H * cos.(LinRange(π/2,0,Nz+1)) .- H)meters,
-    topology=(Flat, Bounded, Bounded)
+    topology=(Periodic, Bounded, Bounded)
 )
 
 # ---- 
@@ -25,17 +28,27 @@ coriolis = FPlane(latitude=60)
 # ---- 
 # ---- turbulent diffusivity (with sponges)
 
-@inline νh(x,y,z,t) = ifelse((y>-(Ny/2)kilometers)&(y<(Ny/2)kilometers), 1, 100)
-horizontal_closure = HorizontalScalarDiffusivity(ν=νh, κ=νh)
+# @inline νh(x,y,z,t) = ifelse((y>-(Ny/2)kilometers)&(y<(Ny/2)kilometers), 1, 100)
+# @inline νz(x,y,z,t) = ifelse((y>-(Ny/2)kilometers)&(y<(Ny/2)kilometers), 1e-5, 1e-3)
 
-@inline νz(x,y,z,t) = ifelse((y>-(Ny/2)kilometers)&(y<(Ny/2)kilometers), 1e-5, 1e-3)
-vertical_closure = ScalarDiffusivity(ν=νz, κ=νz)
+# horizontal_closure = HorizontalScalarDiffusivity(ν=νh, κ=νh)
+# vertical_closure = ScalarDiffusivity(ν=νz, κ=νz)
+horizontal_closure = HorizontalScalarDiffusivity(ν=1, κ=1)
+vertical_closure = ScalarDiffusivity(ν=1e-5, κ=1e-5)
+
 
 # ---- 
 # ---- instantiate model
-ub = Field((Face, Center, Center), grid)
-vb = Field((Center, Face, Center), grid)
-wb = Field((Center, Center, Face), grid)
+no_penetration = ImpenetrableBoundaryCondition()
+w_mle_bc = FieldBoundaryConditions(grid, (Center, Center, Face), top=no_penetration, bottom=no_penetration)
+
+u_mle = XFaceField(grid)
+v_mle = YFaceField(grid)
+w_mle = ZFaceField(grid, boundary_conditions=w_mle_bc)
+
+# Build AdvectiveForcing
+mle_forcing = AdvectiveForcing(u = u_mle, v = v_mle, w = w_mle)
+
 
 model = NonhydrostaticModel(grid = grid,
                             advection = WENO5(),
@@ -43,7 +56,7 @@ model = NonhydrostaticModel(grid = grid,
                             coriolis = coriolis,
                             closure = (horizontal_closure, vertical_closure),
                             tracers = (:b),
-                            background_fields = (u=ub, v=vb, w=wb),
+                            forcing = (; b = mle_forcing),
                             buoyancy = BuoyancyTracer())
 
 # ---- 
@@ -60,6 +73,7 @@ const ρₒ = 1026
 
 # front function
 @inline front(x, y, z, cy) = tanh((y-cy)/12kilometers)
+# @inline front(x, y, z, cx) = tanh((x-cx)/12kilometers)
 
 @inline function B(x, y, z)
     fronts = front(x, y, z, -120kilometers) + front(x, y, z, 0) + front(x, y, z, 120kilometers)
@@ -76,25 +90,28 @@ f = model.coriolis.f
 
 # shear operations
 uz_op = @at((Face, Center, Center), - ∂y(b) / f );
+vz_op = @at((Center, Face, Center), - ∂x(b) / f );
 
 # compute shear
 uz = compute!(Field(uz_op))
+vz = compute!(Field(vz_op))
 
 # include function for cumulative integration
 include("src/cumulative_vertical_integration.jl")
 
 # compute geostrophic velocities
-U = cumulative_vertical_integration!(uz)
+uᵢ = cumulative_vertical_integration!(uz)
+vᵢ = cumulative_vertical_integration!(vz)
 
 # prescribe geostrophic velocities for initial condition
-set!(model; u = U)
+set!(model; u = uᵢ, v = vᵢ)
 
 # ---- 
 # ---- create a simulation with adaptive time stepping based on CFL condition
 
-simulation = Simulation(model, Δt = 1minutes, stop_time = 10day)
+simulation = Simulation(model, Δt = 1minutes, stop_time = 10days)
 
-wizard = TimeStepWizard(cfl=1.0, max_change=1.1, max_Δt=5minutes)
+wizard = TimeStepWizard(cfl = 1.0, max_change = 1.1, max_Δt = 5minutes)
 simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 
 # ---- 
@@ -204,38 +221,46 @@ function compute_Ψₑ!(Ψₑ, h, ∂ₕb, N, μ, f; ce = 0.06, Lfₘ = 500meter
     return nothing
 end
 
-# x-component of Ψ
 Ψx = Field{Center, Face, Face}(grid)
+Ψy = Field{Face, Center, Face}(grid)
 
 # structure function
 @inline μ(z,h) = (1-(2*z/h + 1)^2)*(1+(5/21)*(2*z/h + 1)^2)
 
-compute_Ψₑ!(simulation) = compute_Ψₑ!(Ψx, h, ∂b∂y, sqrt(∂b∂z), μ, f)
+compute_Ψx!(simulation) = compute_Ψₑ!(Ψx, h, ∂b∂y, sqrt(∂b∂z), μ, f)
+compute_Ψy!(simulation) = compute_Ψₑ!(Ψy, h, ∂b∂x, sqrt(∂b∂z), μ, f)
+
 # add the function to the callbacks of the simulation
-simulation.callbacks[:compute_Ψₑ] = Callback(compute_Ψₑ!)
+simulation.callbacks[:compute_Ψx] = Callback(compute_Ψx!)
+simulation.callbacks[:compute_Ψy] = Callback(compute_Ψy!)
 
 
-v_op = @at((Center, Face, Center),   ∂z(Ψx));
-w_op = @at((Center, Center, Face), - ∂y(Ψx));
 
-function compute_background_vel!(sim)
-    u, v, w = sim.model.background_fields.velocities
-    v .= v_op
-    w .= w_op
-    fill_halo_regions!(v, sim.model.architecture)
-    fill_halo_regions!(w, sim.model.architecture)
+u_op = @at((Face, Center, Center),  - ∂z(Ψy));
+v_op = @at((Center, Face, Center),    ∂z(Ψx));
+w_op = @at((Center, Center, Face),    ∂x(Ψy) - ∂y(Ψx));
+
+function compute_mle_velocity!(sim)
+    u_mle .= u_op
+    v_mle .= v_op
+    w_mle .= w_op
+    Oceananigans.BoundaryConditions.fill_halo_regions!(u_mle)
+    Oceananigans.BoundaryConditions.fill_halo_regions!(v_mle)
+    Oceananigans.BoundaryConditions.fill_halo_regions!(w_mle)
     return nothing
 end
-simulation.callbacks[:compute_background_vel] = Callback(compute_background_vel!)
+
+
+simulation.callbacks[:compute_mle_velocity] = Callback(compute_mle_velocity!)
 
 # ----
 # ---- setting up the model output
 
-outputs = merge(model.velocities, model.tracers, (; h, ∂b∂y, Ψx)) # make a NamedTuple with all outputs
+outputs = merge(model.velocities, model.tracers, (;u_mle=u_mle, v_mle=v_mle, w_mle=w_mle, h, ∂b∂x, ∂b∂y, Ψx, Ψy)) # make a NamedTuple with all outputs
 
 simulation.output_writers[:fields] =
-    NetCDFOutputWriter(model, outputs, filepath = "data/output.nc",
-                     schedule=TimeInterval(8hours))
+    NetCDFOutputWriter(model, outputs, filename = "data/output.nc",
+                     schedule=TimeInterval(3hours))
 
 # ----
 # ---- setting up the model progress messages
