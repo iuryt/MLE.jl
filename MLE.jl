@@ -4,34 +4,16 @@ using Oceananigans.BoundaryConditions: ImpenetrableBoundaryCondition
 
 # ---- define size and create a grid
 
-const sponge = 20 #number of points for sponge
-const Nx = 46 # number of points in x
+# const Nx = 46 # number of points in x
 const Ny = 46 # number of points in y
 const Nz = 48 # number of points in z
 const H = 1000 # maximum depth
 
 
-# grid = RectilinearGrid(GPU(),
-#     size=(Nx, Ny, Nz),
-#     halo=(3, 3, 3),
-#     x=(-10*(Nx/2)kilometers, 10*(Nx/2)kilometers), 
-#     y=(-10*(Ny/2)kilometers, 10*(Ny/2)kilometers), 
-#     z=(H * cos.(LinRange(π/2,0,Nz+1)) .- H)meters,
-#     topology=(Periodic, Bounded, Bounded)
-# )
-
-# grid = RectilinearGrid(GPU(),
-#     size=(Nx, Nz),
-#     halo=(3, 3),
-#     x=(-10*(Nx/2)kilometers, 10*(Nx/2)kilometers), 
-#     z=(H * cos.(LinRange(π/2,0,Nz+1)) .- H)meters,
-#     topology=(Bounded, Flat, Bounded)
-# )
-
-grid = RectilinearGrid(CPU(),
+grid = RectilinearGrid(GPU(),
     size=(Ny, Nz),
     halo=(3, 3),
-    y=(-10*(Nx/2)kilometers, 10*(Nx/2)kilometers), 
+    y=(-10*(Ny/2)kilometers, 10*(Ny/2)kilometers), 
     z=(H * cos.(LinRange(π/2,0,Nz+1)) .- H)meters,
     topology=(Flat, Bounded, Bounded)
 )
@@ -42,29 +24,29 @@ grid = RectilinearGrid(CPU(),
 coriolis = FPlane(latitude=60)
 
 # ---- 
-# ---- turbulent diffusivity (with sponges)
+# ---- turbulent diffusivity
 
-# @inline νh(x,y,z,t) = ifelse((y>-(Ny/2)kilometers)&(y<(Ny/2)kilometers), 1, 100)
-# @inline νz(x,y,z,t) = ifelse((y>-(Ny/2)kilometers)&(y<(Ny/2)kilometers), 1e-5, 1e-3)
-
-# horizontal_closure = HorizontalScalarDiffusivity(ν=νh, κ=νh)
-# vertical_closure = ScalarDiffusivity(ν=νz, κ=νz)
 horizontal_closure = HorizontalScalarDiffusivity(ν=1, κ=1)
 vertical_closure = ScalarDiffusivity(ν=1e-5, κ=1e-5)
 
 
 # ---- 
-# ---- instantiate model
+# ---- initial mixed-layer eddy velocities
+
+# no penetration bc for mixed-layer eddy vertical velocity
 no_penetration = ImpenetrableBoundaryCondition()
 w_mle_bc = FieldBoundaryConditions(grid, (Center, Center, Face), top=no_penetration, bottom=no_penetration)
 
+# initial zero fields for mixed-layer eddy velocities
 u_mle = XFaceField(grid)
 v_mle = YFaceField(grid)
 w_mle = ZFaceField(grid, boundary_conditions=w_mle_bc)
 
-# Build AdvectiveForcing
+# build AdvectiveForcing from mixed-layer eddy velocities
 mle_forcing = AdvectiveForcing(u = u_mle, v = v_mle, w = w_mle)
 
+# ---- 
+# ---- instantiate model
 
 model = NonhydrostaticModel(grid = grid,
                             advection = WENO5(),
@@ -258,14 +240,14 @@ simulation.callbacks[:compute_Ψx] = Callback(compute_Ψx!)
 simulation.callbacks[:compute_Ψy] = Callback(compute_Ψy!)
 
 
-u_op = @at((Face, Center, Center),   ∂z(Ψy));
-v_op = @at((Center, Face, Center),   ∂z(Ψx));
-w_op = @at((Center, Center, Face), -(∂x(Ψy) + ∂y(Ψx)));
+u_mle_op = @at((Face, Center, Center),   ∂z(Ψy));
+v_mle_op = @at((Center, Face, Center),   ∂z(Ψx));
+w_mle_op = @at((Center, Center, Face), -(∂x(Ψy) + ∂y(Ψx)));
 
 function compute_mle_velocity!(sim)
-    u_mle .= u_op
-    v_mle .= v_op
-    w_mle .= w_op
+    u_mle .= u_mle_op
+    v_mle .= v_mle_op
+    w_mle .= w_mle_op
     Oceananigans.BoundaryConditions.fill_halo_regions!(u_mle)
     Oceananigans.BoundaryConditions.fill_halo_regions!(v_mle)
     Oceananigans.BoundaryConditions.fill_halo_regions!(w_mle)
