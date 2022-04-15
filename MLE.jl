@@ -11,13 +11,29 @@ const Nz = 48 # number of points in z
 const H = 1000 # maximum depth
 
 
-grid = RectilinearGrid(GPU(),
-    size=(Nx, Ny, Nz),
-    halo=(3, 3, 3),
-    x=(-10*(Nx/2)kilometers, 10*(Nx/2)kilometers), 
-    y=(-10*(Ny/2)kilometers, 10*(Ny/2)kilometers), 
+# grid = RectilinearGrid(GPU(),
+#     size=(Nx, Ny, Nz),
+#     halo=(3, 3, 3),
+#     x=(-10*(Nx/2)kilometers, 10*(Nx/2)kilometers), 
+#     y=(-10*(Ny/2)kilometers, 10*(Ny/2)kilometers), 
+#     z=(H * cos.(LinRange(π/2,0,Nz+1)) .- H)meters,
+#     topology=(Periodic, Bounded, Bounded)
+# )
+
+# grid = RectilinearGrid(GPU(),
+#     size=(Nx, Nz),
+#     halo=(3, 3),
+#     x=(-10*(Nx/2)kilometers, 10*(Nx/2)kilometers), 
+#     z=(H * cos.(LinRange(π/2,0,Nz+1)) .- H)meters,
+#     topology=(Bounded, Flat, Bounded)
+# )
+
+grid = RectilinearGrid(CPU(),
+    size=(Ny, Nz),
+    halo=(3, 3),
+    y=(-10*(Nx/2)kilometers, 10*(Nx/2)kilometers), 
     z=(H * cos.(LinRange(π/2,0,Nz+1)) .- H)meters,
-    topology=(Periodic, Bounded, Bounded)
+    topology=(Flat, Bounded, Bounded)
 )
 
 # ---- 
@@ -164,7 +180,7 @@ using Oceananigans.Grids
 using Oceananigans.Operators: Δzᶜᶜᶜ, Δzᶜᶜᶠ
 
 
-@kernel function _compute_Ψₑ!(Ψₑ, grid, h, ∂ₕb, N, μ, f, ce, Lfₘ, ΔS, τ)
+@kernel function _compute_Ψₑ!(Ψₑ, grid, h, ∂ₕb, N, μ, f, ce, Lfₘ, ΔS, τ, minpoints, Vm)
     i, j = @index(Global, NTuple)
 
     # average ∇ₕb and N over the mixed layer
@@ -175,11 +191,15 @@ using Oceananigans.Operators: Δzᶜᶜᶜ, Δzᶜᶜᶠ
 
     h_ij = @inbounds h[i, j]
     
+    # number of z points in the mixed layer
+    npoints = 0
+    
     @unroll for k in grid.Nz : -1 : 1 # scroll from surface to bottom       
         z_center = znode(Center(), Face(), Face(), i, j, k, grid)
 
         if z_center > -h_ij
-
+            npoints += 1
+            
             Δz_ijk = Δzᶜᶜᶜ(i, j, k, grid)
 
             ∂ₕb_sum = ∂ₕb_sum + @inbounds ∂ₕb[i, j, k] * Δz_ijk
@@ -197,9 +217,12 @@ using Oceananigans.Operators: Δzᶜᶜᶜ, Δzᶜᶜᶠ
     # compute eddy stream function
     @unroll for k in grid.Nz : -1 : 1 # scroll to point just above the bottom       
         z_face = znode(Center(), Face(), Face(), i, j, k, grid)
-
-        if z_face > -h_ij
-            @inbounds Ψₑ[i, j, k] = ce * (ΔS/Lf) * ((h_ij^2)/sqrt(f^2 + τ^-2)) * μ(z_face,h_ij) * ∂ₕbₘₗ
+        
+        Ψ_max = @inbounds Δzᶜᶜᶠ(i, j, k, grid) * Vm
+        Ψ_ijk = ce * (ΔS/Lf) * ((h_ij^2)/sqrt(f^2 + τ^-2)) * μ(z_face,h_ij) * ∂ₕbₘₗ
+        
+        if (z_face > -h_ij)&(npoints > minpoints)
+            @inbounds Ψₑ[i, j, k] = min(Ψ_max, Ψ_ijk)
         else
             @inbounds Ψₑ[i, j, k] = 0.0
         end
@@ -207,13 +230,13 @@ using Oceananigans.Operators: Δzᶜᶜᶜ, Δzᶜᶜᶠ
 
 end
 
-function compute_Ψₑ!(Ψₑ, h, ∂ₕb, N, μ, f; ce = 0.06, Lfₘ = 500meters, ΔS=10e3, τ=86400)
+function compute_Ψₑ!(Ψₑ, h, ∂ₕb, N, μ, f; ce = 0.06, Lfₘ = 500meters, ΔS=10e3, τ=86400, minpoints=4, Vm=0.5)
     grid = h.grid
     arch = architecture(grid)
 
 
     event = launch!(arch, grid, :xy,
-                    _compute_Ψₑ!, Ψₑ, grid, h, ∂ₕb, N, μ, f, ce, Lfₘ, ΔS, τ,
+                    _compute_Ψₑ!, Ψₑ, grid, h, ∂ₕb, N, μ, f, ce, Lfₘ, ΔS, τ, minpoints, Vm,
                     dependencies = device_event(arch))
 
     wait(device_event(arch), event)
@@ -227,18 +250,17 @@ end
 # structure function
 @inline μ(z,h) = (1-(2*z/h + 1)^2)*(1+(5/21)*(2*z/h + 1)^2)
 
-compute_Ψx!(simulation) = compute_Ψₑ!(Ψx, h, ∂b∂y, sqrt(∂b∂z), μ, f)
-compute_Ψy!(simulation) = compute_Ψₑ!(Ψy, h, ∂b∂x, sqrt(∂b∂z), μ, f)
+compute_Ψx!(simulation) = compute_Ψₑ!(Ψx, @at((Center, Face, Nothing), h), ∂b∂y, sqrt(∂b∂z), μ, f)
+compute_Ψy!(simulation) = compute_Ψₑ!(Ψy, @at((Face, Center, Nothing), h), ∂b∂x, sqrt(∂b∂z), μ, f)
 
 # add the function to the callbacks of the simulation
 simulation.callbacks[:compute_Ψx] = Callback(compute_Ψx!)
 simulation.callbacks[:compute_Ψy] = Callback(compute_Ψy!)
 
 
-
-u_op = @at((Face, Center, Center),  - ∂z(Ψy));
-v_op = @at((Center, Face, Center),    ∂z(Ψx));
-w_op = @at((Center, Center, Face),    ∂x(Ψy) - ∂y(Ψx));
+u_op = @at((Face, Center, Center),   ∂z(Ψy));
+v_op = @at((Center, Face, Center),   ∂z(Ψx));
+w_op = @at((Center, Center, Face), -(∂x(Ψy) + ∂y(Ψx)));
 
 function compute_mle_velocity!(sim)
     u_mle .= u_op
@@ -256,7 +278,7 @@ simulation.callbacks[:compute_mle_velocity] = Callback(compute_mle_velocity!)
 # ----
 # ---- setting up the model output
 
-outputs = merge(model.velocities, model.tracers, (;u_mle=u_mle, v_mle=v_mle, w_mle=w_mle, h, ∂b∂x, ∂b∂y, Ψx, Ψy)) # make a NamedTuple with all outputs
+outputs = merge(model.velocities, model.tracers, (; u_mle=u_mle, v_mle=v_mle, w_mle=w_mle, h, hx=@at((Center, Face, Nothing), h), hy=@at((Face, Center, Nothing), h), ∂b∂x, ∂b∂y, Ψx, Ψy)) # make a NamedTuple with all outputs
 
 simulation.output_writers[:fields] =
     NetCDFOutputWriter(model, outputs, filename = "data/output.nc",
@@ -271,11 +293,12 @@ function print_progress(simulation)
     u, v, w = simulation.model.velocities
 
     # Print a progress message
-    msg = @sprintf("i: %04d, t: %s, Δt: %s, umax = (%.1e, %.1e, %.1e) ms⁻¹, wall time: %s\n",
+    msg = @sprintf("i: %04d, t: %s, Δt: %s, umax = (%.1e, %.1e, %.1e) ms⁻¹, Ψmax = (%.1e, %.1e), wall time: %s\n",
                    iteration(simulation),
                    prettytime(time(simulation)),
                    prettytime(simulation.Δt),
                    maximum(abs, u), maximum(abs, v), maximum(abs, w),
+                   maximum(abs, Ψx), maximum(abs, Ψy),
                    prettytime(simulation.run_wall_time))
 
     @info msg
